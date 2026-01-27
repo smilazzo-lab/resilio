@@ -1,0 +1,39 @@
+RESILIO - Resilient Cache Framework
+Copyright 2024 RESILIO Contributors
+
+This product includes software developed by third parties:
+
+================================================================================
+Lettuce - Advanced Redis client
+================================================================================
+Copyright 2011-2024 the original author or authors.
+Licensed under the Apache License, Version 2.0
+https://github.com/lettuce-io/lettuce-core
+
+================================================================================
+Apache Commons Pool
+================================================================================
+Copyright 2001-2024 The Apache Software Foundation
+Licensed under the Apache License, Version 2.0
+https://commons.apache.org/proper/commons-pool/
+
+================================================================================
+Jackson JSON processor
+================================================================================
+Copyright 2007-2024 FasterXML, LLC
+Licensed under the Apache License, Version 2.0
+https://github.com/FasterXML/jackson
+
+================================================================================
+JUnit 5
+================================================================================
+Copyright 2015-2024 the original author or authors.
+Licensed under the Eclipse Public License v2.0
+https://junit.org/junit5/
+
+================================================================================
+AssertJ
+================================================================================
+Copyright 2014-2024 the AssertJ authors.
+Licensed under the Apache License, Version 2.0
+https://assertj.github.io/doc/

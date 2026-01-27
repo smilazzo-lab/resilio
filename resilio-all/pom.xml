@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.resilio</groupId>
+        <artifactId>resilio-parent</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>resilio-all</artifactId>
+    <name>RESILIO All-in-One</name>
+    <description>
+        All RESILIO modules in a single dependency.
+        Include this artifact to get the complete RESILIO framework:
+        core caching, zero-GC support, event aggregation, and Redis integration.
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.resilio</groupId>
+            <artifactId>resilio-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.resilio</groupId>
+            <artifactId>resilio-zerogc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.resilio</groupId>
+            <artifactId>resilio-aggregator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.resilio</groupId>
+            <artifactId>resilio-redis</artifactId>
+        </dependency>
+    </dependencies>
+</project>

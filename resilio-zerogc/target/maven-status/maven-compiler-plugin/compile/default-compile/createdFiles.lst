@@ -1,0 +1,5 @@
+io\resilio\zerogc\PrimitiveArrayCache$Builder.class
+io\resilio\zerogc\ObjectPool$Builder.class
+io\resilio\zerogc\ObjectPool$PooledHandle.class
+io\resilio\zerogc\ObjectPool.class
+io\resilio\zerogc\PrimitiveArrayCache.class

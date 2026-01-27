@@ -1,0 +1,11 @@
+C:\Users\smilazzo\OneDrive - Anpal Servizi S.p.A\Desktop\profiling\open\open-resilio\resilio-redis\src\main\java\io\resilio\redis\cache\RedisCache.java
+C:\Users\smilazzo\OneDrive - Anpal Servizi S.p.A\Desktop\profiling\open\open-resilio\resilio-redis\src\main\java\io\resilio\redis\connection\RedisCacheConfig.java
+C:\Users\smilazzo\OneDrive - Anpal Servizi S.p.A\Desktop\profiling\open\open-resilio\resilio-redis\src\main\java\io\resilio\redis\connection\RedisConnectionManager.java
+C:\Users\smilazzo\OneDrive - Anpal Servizi S.p.A\Desktop\profiling\open\open-resilio\resilio-redis\src\main\java\io\resilio\redis\pubsub\MessageListener.java
+C:\Users\smilazzo\OneDrive - Anpal Servizi S.p.A\Desktop\profiling\open\open-resilio\resilio-redis\src\main\java\io\resilio\redis\pubsub\RedisPubSub.java
+C:\Users\smilazzo\OneDrive - Anpal Servizi S.p.A\Desktop\profiling\open\open-resilio\resilio-redis\src\main\java\io\resilio\redis\serializer\JacksonSerializer.java
+C:\Users\smilazzo\OneDrive - Anpal Servizi S.p.A\Desktop\profiling\open\open-resilio\resilio-redis\src\main\java\io\resilio\redis\serializer\RedisSerializer.java
+C:\Users\smilazzo\OneDrive - Anpal Servizi S.p.A\Desktop\profiling\open\open-resilio\resilio-redis\src\main\java\io\resilio\redis\serializer\StringSerializer.java
+C:\Users\smilazzo\OneDrive - Anpal Servizi S.p.A\Desktop\profiling\open\open-resilio\resilio-redis\src\main\java\io\resilio\redis\stream\RedisStream.java
+C:\Users\smilazzo\OneDrive - Anpal Servizi S.p.A\Desktop\profiling\open\open-resilio\resilio-redis\src\main\java\io\resilio\redis\stream\StreamListener.java
+C:\Users\smilazzo\OneDrive - Anpal Servizi S.p.A\Desktop\profiling\open\open-resilio\resilio-redis\src\main\java\io\resilio\redis\stream\StreamMessage.java

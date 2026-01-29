@@ -21,6 +21,7 @@ A high-performance caching framework for Java with built-in resilience patterns,
 9. [Testing Guide](#9-testing-guide)
 10. [Build and Deploy](#10-build-and-deploy)
 11. [Best Practices](#11-best-practices)
+12. [Have Fun: Advanced Patterns](#12-have-fun-advanced-patterns)
 
 ---
 
@@ -1334,6 +1335,665 @@ void reportMetrics() {
     CacheStats stats = cache.stats();
     metrics.gauge("cache.hit_rate", stats.hitRate());
 }
+```
+
+---
+
+## 12. Have Fun: Advanced Patterns
+
+This section shows how to combine RESILIO components to build powerful, production-grade architectures.
+
+### 12.1 The Resilient Query Engine
+
+Combine **Interceptors + CircuitBreaker + Cache + Metrics** for a bulletproof query layer:
+
+```java
+/**
+ * A query engine that:
+ * - Adds security filters automatically
+ * - Caches results with TTL
+ * - Protects against database failures
+ * - Logs everything for audit
+ * - Tracks performance metrics
+ */
+public class ResilientQueryEngine<T> {
+
+    private final Repository<T> repository;
+    private final TtlCache<String, List<T>> cache;
+    private final CircuitBreaker dbCircuit;
+    private final InterceptorChain<QueryContext, List<T>> chain;
+
+    public ResilientQueryEngine(Repository<T> repository, User user) {
+        this.repository = repository;
+
+        // Cache with 5-minute TTL
+        this.cache = TtlCache.<String, List<T>>builder()
+            .name("query-cache-" + repository.getEntityName())
+            .ttl(Duration.ofMinutes(5))
+            .maxSize(1000)
+            .build();
+
+        // Circuit breaker for DB protection
+        this.dbCircuit = CircuitBreaker.builder()
+            .name("db-" + repository.getEntityName())
+            .failureThreshold(3)
+            .resetTimeout(Duration.ofSeconds(30))
+            .build();
+
+        // Build the interceptor chain
+        this.chain = InterceptorChain.<QueryContext, List<T>>builder()
+            .add(new SecurityInterceptor<>(user))      // order=10
+            .add(new CacheInterceptor<>(cache))        // order=20
+            .add(new CircuitBreakerInterceptor<>())    // order=30
+            .add(new MetricsInterceptor<>())           // order=40
+            .add(new AuditInterceptor<>(user))         // order=50
+            .build();
+    }
+
+    public List<T> query(Specification<T> spec) {
+        QueryContext ctx = new QueryContext(spec, dbCircuit);
+        return chain.execute(ctx, this::executeQuery);
+    }
+
+    private List<T> executeQuery(QueryContext ctx) {
+        return dbCircuit.execute(() ->
+            repository.findAll(ctx.getSpec())
+        );
+    }
+}
+```
+
+**The Interceptors:**
+
+```java
+// 1. Security: Add WHERE clause based on user permissions
+class SecurityInterceptor<T> implements Interceptor<QueryContext, List<T>> {
+    private final User user;
+
+    @Override
+    public QueryContext before(QueryContext ctx) {
+        Specification<T> secured = ctx.getSpec()
+            .and(belongsToOrgUnits(user.getAllowedOrgUnits()));
+        return ctx.withSpec(secured);
+    }
+
+    @Override
+    public int order() { return 10; }
+}
+
+// 2. Cache: Check cache before query, store after
+class CacheInterceptor<T> implements Interceptor<QueryContext, List<T>> {
+    private final TtlCache<String, List<T>> cache;
+
+    @Override
+    public QueryContext before(QueryContext ctx) {
+        String cacheKey = ctx.getCacheKey();
+        List<T> cached = cache.getIfPresent(cacheKey);
+        if (cached != null) {
+            ctx.setCachedResult(cached);  // Skip DB query
+        }
+        return ctx;
+    }
+
+    @Override
+    public List<T> after(QueryContext ctx, List<T> result) {
+        if (!ctx.wasCacheHit()) {
+            cache.put(ctx.getCacheKey(), result);
+        }
+        return result;
+    }
+
+    @Override
+    public int order() { return 20; }
+}
+
+// 3. Metrics: Track query performance
+class MetricsInterceptor<T> implements Interceptor<QueryContext, List<T>> {
+    @Override
+    public QueryContext before(QueryContext ctx) {
+        ctx.setStartTime(System.nanoTime());
+        return ctx;
+    }
+
+    @Override
+    public List<T> after(QueryContext ctx, List<T> result) {
+        long duration = System.nanoTime() - ctx.getStartTime();
+        Metrics.timer("query.duration")
+            .tag("entity", ctx.getEntityName())
+            .tag("cached", ctx.wasCacheHit())
+            .record(duration, TimeUnit.NANOSECONDS);
+        return result;
+    }
+
+    @Override
+    public void onError(QueryContext ctx, Exception error) {
+        Metrics.counter("query.errors")
+            .tag("entity", ctx.getEntityName())
+            .increment();
+    }
+
+    @Override
+    public int order() { return 40; }
+}
+```
+
+### 12.2 Multi-Layer Cache with Fallback
+
+Build a **L1 (local) + L2 (Redis) + DB** cache hierarchy:
+
+```java
+/**
+ * Three-tier caching:
+ * L1: Local LRU (microseconds, limited size)
+ * L2: Redis (milliseconds, large capacity)
+ * L3: Database (fallback)
+ */
+public class MultiLayerCache<K, V> implements Cache<K, V> {
+
+    private final LruCache<K, V> l1Cache;
+    private final RedisCache<K, V> l2Cache;
+    private final CircuitBreaker redisCircuit;
+    private final Function<K, V> dbLoader;
+
+    public MultiLayerCache(String name, Function<K, V> dbLoader,
+                           RedisCacheConfig redisConfig) {
+        this.dbLoader = dbLoader;
+
+        // L1: Fast local cache (1000 entries)
+        this.l1Cache = LruCache.<K, V>builder()
+            .name(name + "-l1")
+            .maxSize(1000)
+            .build();
+
+        // L2: Redis with circuit breaker
+        this.l2Cache = RedisCache.<K, V>builder()
+            .name(name + "-l2")
+            .config(redisConfig)
+            .ttl(Duration.ofMinutes(30))
+            .build();
+
+        // Protect Redis calls
+        this.redisCircuit = CircuitBreaker.builder()
+            .name(name + "-redis-circuit")
+            .failureThreshold(5)
+            .resetTimeout(Duration.ofSeconds(10))
+            .build();
+    }
+
+    @Override
+    public V get(K key, Function<K, V> loader) {
+        // Try L1 first (fastest)
+        V value = l1Cache.getIfPresent(key);
+        if (value != null) {
+            return value;
+        }
+
+        // Try L2 with circuit breaker protection
+        value = tryL2(key);
+        if (value != null) {
+            l1Cache.put(key, value);  // Promote to L1
+            return value;
+        }
+
+        // Fall back to DB
+        value = dbLoader.apply(key);
+        if (value != null) {
+            l1Cache.put(key, value);
+            tryPutL2(key, value);
+        }
+        return value;
+    }
+
+    private V tryL2(K key) {
+        try {
+            return redisCircuit.execute(() -> l2Cache.getIfPresent(key));
+        } catch (CircuitBreakerOpenException e) {
+            // Redis unavailable, skip silently
+            return null;
+        }
+    }
+
+    private void tryPutL2(K key, V value) {
+        try {
+            redisCircuit.execute(() -> {
+                l2Cache.put(key, value);
+                return null;
+            });
+        } catch (CircuitBreakerOpenException e) {
+            // Redis unavailable, skip silently
+        }
+    }
+
+    @Override
+    public void invalidate(K key) {
+        l1Cache.invalidate(key);
+        tryL2Invalidate(key);
+    }
+}
+```
+
+### 12.3 Event-Driven Cache Invalidation
+
+Combine **Redis Pub/Sub + Local Cache** for distributed invalidation:
+
+```java
+/**
+ * When one instance invalidates a cache entry,
+ * all other instances are notified via Redis Pub/Sub.
+ */
+public class DistributedCache<K, V> implements Cache<K, V> {
+
+    private final LruCache<K, V> localCache;
+    private final RedisPubSub pubsub;
+    private final String channel;
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    public DistributedCache(String name, int maxSize,
+                            RedisConnectionManager redis) {
+        this.channel = "cache-invalidate:" + name;
+
+        this.localCache = LruCache.<K, V>builder()
+            .name(name)
+            .maxSize(maxSize)
+            .build();
+
+        this.pubsub = new RedisPubSub(redis);
+
+        // Subscribe to invalidation events
+        pubsub.subscribe(channel, this::handleInvalidation);
+    }
+
+    @Override
+    public void invalidate(K key) {
+        // Invalidate locally
+        localCache.invalidate(key);
+
+        // Broadcast to other instances
+        pubsub.publish(channel, serializeKey(key));
+    }
+
+    private void handleInvalidation(String message) {
+        K key = deserializeKey(message);
+        localCache.invalidate(key);  // No re-broadcast!
+    }
+
+    @Override
+    public V get(K key, Function<K, V> loader) {
+        return localCache.get(key, loader);
+    }
+}
+```
+
+### 12.4 Smart Rate Limiter with Interceptor
+
+Use **Interceptor + PrimitiveArrayCache** for zero-GC rate limiting:
+
+```java
+/**
+ * Rate limiter that:
+ * - Uses zero-allocation counters
+ * - Integrates as interceptor
+ * - Fails fast when limit exceeded
+ */
+public class RateLimitInterceptor<C, R> implements Interceptor<C, R> {
+
+    private final PrimitiveArrayCache counters;
+    private final Function<C, String> keyExtractor;
+    private final int maxRequestsPerMinute;
+    private final Map<String, Integer> keyIndices = new ConcurrentHashMap<>();
+
+    public RateLimitInterceptor(int maxRequestsPerMinute,
+                                 Function<C, String> keyExtractor) {
+        this.maxRequestsPerMinute = maxRequestsPerMinute;
+        this.keyExtractor = keyExtractor;
+        this.counters = PrimitiveArrayCache.builder()
+            .name("rate-limit-counters")
+            .capacity(10_000)
+            .build();
+
+        // Reset counters every minute
+        Executors.newSingleThreadScheduledExecutor()
+            .scheduleAtFixedRate(this::resetCounters, 1, 1, TimeUnit.MINUTES);
+    }
+
+    @Override
+    public C before(C context) {
+        String key = keyExtractor.apply(context);
+        int idx = getOrCreateIndex(key);
+
+        int current = counters.incrementInt(idx);
+        if (current > maxRequestsPerMinute) {
+            throw new RateLimitExceededException(key, maxRequestsPerMinute);
+        }
+        return context;
+    }
+
+    @Override
+    public int order() { return 1; }  // Run first!
+
+    private int getOrCreateIndex(String key) {
+        return keyIndices.computeIfAbsent(key,
+            k -> counters.registerKey(k));
+    }
+
+    private void resetCounters() {
+        keyIndices.values().forEach(idx -> counters.putInt(idx, 0));
+    }
+}
+
+// Usage in chain:
+InterceptorChain<ApiRequest, ApiResponse> chain = InterceptorChain
+    .<ApiRequest, ApiResponse>builder()
+    .add(new RateLimitInterceptor<>(100, req -> req.getClientId()))
+    .add(new AuthInterceptor<>())
+    .add(new ValidationInterceptor<>())
+    .add(new AuditInterceptor<>())
+    .build();
+```
+
+### 12.5 The Ultimate API Gateway
+
+Combine **everything** into a production API gateway:
+
+```java
+/**
+ * API Gateway with:
+ * - Rate limiting (zero-GC)
+ * - Authentication
+ * - Circuit breaker per backend
+ * - Response caching
+ * - Request/Response transformation
+ * - Metrics & Audit
+ * - Graceful degradation
+ */
+public class ApiGateway {
+
+    private final Map<String, BackendService> backends = new HashMap<>();
+    private final InterceptorChain<GatewayRequest, GatewayResponse> chain;
+    private final TtlCache<String, GatewayResponse> responseCache;
+
+    public ApiGateway(GatewayConfig config) {
+        // Response cache
+        this.responseCache = TtlCache.<String, GatewayResponse>builder()
+            .name("gateway-response-cache")
+            .ttl(Duration.ofSeconds(30))
+            .maxSize(10_000)
+            .build();
+
+        // Initialize backends with circuit breakers
+        for (BackendConfig backend : config.getBackends()) {
+            backends.put(backend.getName(), new BackendService(
+                backend,
+                CircuitBreaker.builder()
+                    .name("backend-" + backend.getName())
+                    .failureThreshold(backend.getFailureThreshold())
+                    .resetTimeout(backend.getResetTimeout())
+                    .build()
+            ));
+        }
+
+        // Build the gateway interceptor chain
+        this.chain = InterceptorChain.<GatewayRequest, GatewayResponse>builder()
+            // 1. Rate limiting (first line of defense)
+            .add(new RateLimitInterceptor<>(
+                config.getRateLimit(),
+                req -> req.getClientId()
+            ))
+            // 2. Authentication
+            .add(new AuthInterceptor<>(config.getAuthProvider()))
+            // 3. Request validation
+            .add(new ValidationInterceptor<>())
+            // 4. Request transformation (add headers, rewrite paths)
+            .before(this::transformRequest)
+            // 5. Response caching check
+            .add(new ResponseCacheInterceptor<>(responseCache))
+            // 6. Metrics collection
+            .add(new MetricsInterceptor<>())
+            // 7. Audit logging
+            .add(new AuditInterceptor<>())
+            .build();
+    }
+
+    public GatewayResponse handle(GatewayRequest request) {
+        return chain.execute(request, this::routeToBackend);
+    }
+
+    private GatewayResponse routeToBackend(GatewayRequest request) {
+        BackendService backend = backends.get(request.getBackendName());
+        if (backend == null) {
+            return GatewayResponse.notFound();
+        }
+
+        try {
+            return backend.call(request);
+        } catch (CircuitBreakerOpenException e) {
+            // Graceful degradation
+            return responseCache.getIfPresent(request.getCacheKey());
+            // Or return cached stale data, or default response
+        }
+    }
+
+    private GatewayRequest transformRequest(GatewayRequest req) {
+        return req.toBuilder()
+            .addHeader("X-Gateway-Id", gatewayId)
+            .addHeader("X-Request-Id", UUID.randomUUID().toString())
+            .addHeader("X-Timestamp", Instant.now().toString())
+            .build();
+    }
+}
+```
+
+### 12.6 Async Event Pipeline
+
+Combine **AsyncBuffer + EventAggregator + Redis Streams**:
+
+```java
+/**
+ * High-throughput event pipeline:
+ * 1. Buffer incoming events (backpressure)
+ * 2. Aggregate by session (reduce volume)
+ * 3. Publish to Redis Stream (durability)
+ * 4. Consumer groups process in parallel
+ */
+public class EventPipeline {
+
+    private final AsyncBuffer<RawEvent> inputBuffer;
+    private final EventAggregator<RawEvent, SessionSummary> aggregator;
+    private final RedisStream outputStream;
+
+    public EventPipeline(RedisConnectionManager redis) {
+        this.outputStream = new RedisStream(redis, "events-stream");
+
+        // Aggregator: group events by session
+        this.aggregator = EventAggregator.<RawEvent, SessionSummary>builder()
+            .keyExtractor(e -> e.getSessionId())
+            .summaryFactory(SessionSummary::new)
+            .accumulator((summary, event) -> {
+                summary.incrementEventCount();
+                summary.updateLastActivity(event.getTimestamp());
+                summary.addPageView(event.getPage());
+            })
+            .onFlush(summary -> {
+                // Publish aggregated summary to Redis Stream
+                outputStream.add(summary.toMap());
+            })
+            .flushInterval(Duration.ofSeconds(30))
+            .maxEventsBeforeFlush(100)
+            .maxBuckets(50_000)
+            .build();
+
+        // Input buffer: handle burst traffic
+        this.inputBuffer = AsyncBuffer.<RawEvent>builder()
+            .name("event-input-buffer")
+            .queueCapacity(100_000)
+            .batchSize(1000)
+            .flushInterval(Duration.ofMillis(100))
+            .sender(batch -> {
+                // Feed batch to aggregator
+                batch.forEach(aggregator::record);
+            })
+            .onDropped(event -> {
+                Metrics.counter("events.dropped").increment();
+            })
+            .build();
+    }
+
+    // Called by web servers (must be fast!)
+    public void ingest(RawEvent event) {
+        inputBuffer.offer(event);
+    }
+
+    // Start consumer workers
+    public void startConsumers(int workerCount) {
+        outputStream.createConsumerGroup("processors");
+
+        for (int i = 0; i < workerCount; i++) {
+            String workerId = "worker-" + i;
+            new Thread(() -> {
+                outputStream.consume("processors", workerId, messages -> {
+                    for (StreamMessage msg : messages) {
+                        processMessage(msg);
+                        outputStream.acknowledge("processors", msg.getId());
+                    }
+                });
+            }).start();
+        }
+    }
+}
+```
+
+### 12.7 Self-Healing Service
+
+Combine **CircuitBreaker + Cache + Health Checks**:
+
+```java
+/**
+ * Service that heals itself:
+ * - Detects failures automatically
+ * - Switches to fallback
+ * - Recovers when backend is healthy
+ * - Reports health status
+ */
+public class SelfHealingService<T> {
+
+    private final Supplier<T> primarySupplier;
+    private final Supplier<T> fallbackSupplier;
+    private final CircuitBreaker circuit;
+    private final TtlCache<String, T> cache;
+    private final AtomicReference<ServiceStatus> status;
+
+    public SelfHealingService(String name,
+                               Supplier<T> primary,
+                               Supplier<T> fallback) {
+        this.primarySupplier = primary;
+        this.fallbackSupplier = fallback;
+        this.status = new AtomicReference<>(ServiceStatus.HEALTHY);
+
+        this.circuit = CircuitBreaker.builder()
+            .name(name + "-circuit")
+            .failureThreshold(3)
+            .resetTimeout(Duration.ofSeconds(15))
+            .onStateChange(this::handleStateChange)
+            .build();
+
+        this.cache = TtlCache.<String, T>builder()
+            .name(name + "-cache")
+            .ttl(Duration.ofMinutes(5))
+            .build();
+    }
+
+    public T get(String key) {
+        try {
+            T result = circuit.execute(() -> {
+                T value = primarySupplier.get();
+                cache.put(key, value);  // Update cache on success
+                return value;
+            });
+            status.set(ServiceStatus.HEALTHY);
+            return result;
+
+        } catch (CircuitBreakerOpenException e) {
+            status.set(ServiceStatus.DEGRADED);
+
+            // Try cache first
+            T cached = cache.getIfPresent(key);
+            if (cached != null) {
+                return cached;
+            }
+
+            // Then fallback
+            return fallbackSupplier.get();
+        }
+    }
+
+    private void handleStateChange(State oldState, State newState) {
+        if (newState == State.OPEN) {
+            status.set(ServiceStatus.DEGRADED);
+            alertService.warn("Service degraded: " + name);
+        } else if (newState == State.CLOSED) {
+            status.set(ServiceStatus.HEALTHY);
+            alertService.info("Service recovered: " + name);
+        }
+    }
+
+    public ServiceStatus getStatus() {
+        return status.get();
+    }
+
+    public HealthCheck healthCheck() {
+        return new HealthCheck(
+            status.get(),
+            circuit.getState(),
+            cache.stats().hitRate()
+        );
+    }
+
+    enum ServiceStatus { HEALTHY, DEGRADED, DOWN }
+}
+```
+
+### 12.8 Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         RESILIO ARCHITECTURE                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │                    INTERCEPTOR CHAIN                              │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐ │  │
+│  │  │RateLimit│→ │  Auth   │→ │ Cache   │→ │ Metrics │→ │  Audit  │ │  │
+│  │  └─────────┘  └─────────┘  └─────────┘  └─────────┘  └─────────┘ │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                              │                                          │
+│                              ▼                                          │
+│  ┌────────────────────────────────────────────────────────────────┐    │
+│  │                     CACHING LAYER                               │    │
+│  │  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐         │    │
+│  │  │  L1: LRU    │ ←→ │  L2: Redis  │ ←→ │  L3: DB     │         │    │
+│  │  │ (local)     │    │ (distributed)│    │ (source)    │         │    │
+│  │  └─────────────┘    └─────────────┘    └─────────────┘         │    │
+│  └────────────────────────────────────────────────────────────────┘    │
+│                              │                                          │
+│                              ▼                                          │
+│  ┌────────────────────────────────────────────────────────────────┐    │
+│  │                   RESILIENCE LAYER                              │    │
+│  │  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐         │    │
+│  │  │  Circuit    │    │  Fallback   │    │  Retry      │         │    │
+│  │  │  Breaker    │ →  │  Handler    │ →  │  Logic      │         │    │
+│  │  └─────────────┘    └─────────────┘    └─────────────┘         │    │
+│  └────────────────────────────────────────────────────────────────┘    │
+│                              │                                          │
+│                              ▼                                          │
+│  ┌────────────────────────────────────────────────────────────────┐    │
+│  │                   EVENT PIPELINE                                │    │
+│  │  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐         │    │
+│  │  │ AsyncBuffer │ →  │ Aggregator  │ →  │ Redis Stream│         │    │
+│  │  │ (backpressure)   │ (batching)  │    │ (durability)│         │    │
+│  │  └─────────────┘    └─────────────┘    └─────────────┘         │    │
+│  └────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---

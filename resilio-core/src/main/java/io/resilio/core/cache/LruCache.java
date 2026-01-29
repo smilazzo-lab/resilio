@@ -1,5 +1,7 @@
 package io.resilio.core.cache;
 
+import io.resilio.core.lifecycle.ManagedResource;
+import io.resilio.core.lifecycle.ResilioResourceManager;
 import io.resilio.core.stats.CacheStats;
 
 import java.util.HashSet;
@@ -7,6 +9,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -42,7 +45,10 @@ import java.util.function.Function;
  * @author Salvatore Milazzo <milazzosa@gmail.com>
  * @since 1.0.0
  */
-public class LruCache<K, V> implements Cache<K, V>, CacheStats {
+public class LruCache<K, V> implements Cache<K, V>, CacheStats, ManagedResource {
+
+    // Average estimated bytes per entry (key + value + overhead)
+    private static final int ESTIMATED_BYTES_PER_ENTRY = 256;
 
     private final Map<K, V> cache;
     private final ReadWriteLock lock = new ReentrantReadWriteLock();
@@ -53,6 +59,9 @@ public class LruCache<K, V> implements Cache<K, V>, CacheStats {
     private final LongAdder hits = new LongAdder();
     private final LongAdder misses = new LongAdder();
     private final LongAdder evictions = new LongAdder();
+
+    // GOVERNANCE V16: Track last access for idle detection
+    private final AtomicLong lastAccessTimeMillis = new AtomicLong(System.currentTimeMillis());
 
     @SuppressWarnings("serial")
     private LruCache(Builder<K, V> builder) {
@@ -70,6 +79,9 @@ public class LruCache<K, V> implements Cache<K, V>, CacheStats {
                 return shouldRemove;
             }
         };
+
+        // GOVERNANCE V16: Auto-register with ResourceManager for idle cleanup
+        ResilioResourceManager.getInstance().register(this);
     }
 
     /**
@@ -84,6 +96,7 @@ public class LruCache<K, V> implements Cache<K, V>, CacheStats {
 
     @Override
     public V get(K key, Function<K, V> loader) {
+        lastAccessTimeMillis.set(System.currentTimeMillis());
         // Try read lock first
         lock.readLock().lock();
         try {
@@ -119,6 +132,7 @@ public class LruCache<K, V> implements Cache<K, V>, CacheStats {
 
     @Override
     public Optional<V> getIfPresent(K key) {
+        lastAccessTimeMillis.set(System.currentTimeMillis());
         lock.readLock().lock();
         try {
             V value = cache.get(key);
@@ -138,6 +152,7 @@ public class LruCache<K, V> implements Cache<K, V>, CacheStats {
         if (value == null) {
             return;
         }
+        lastAccessTimeMillis.set(System.currentTimeMillis());
         lock.writeLock().lock();
         try {
             cache.put(key, value);
@@ -230,6 +245,43 @@ public class LruCache<K, V> implements Cache<K, V>, CacheStats {
         } finally {
             lock.readLock().unlock();
         }
+    }
+
+    // =====================================================================
+    // GOVERNANCE V16: ManagedResource implementation
+    // =====================================================================
+
+    @Override
+    public long estimatedMemoryBytes() {
+        return size() * ESTIMATED_BYTES_PER_ENTRY;
+    }
+
+    @Override
+    public long itemCount() {
+        return size();
+    }
+
+    @Override
+    public long releaseAll() {
+        lock.writeLock().lock();
+        try {
+            long count = cache.size();
+            cache.clear();
+            return count;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    @Override
+    public long releaseExpired() {
+        // LRU cache has no expiration - nothing to release
+        return 0;
+    }
+
+    @Override
+    public long lastAccessTimeMillis() {
+        return lastAccessTimeMillis.get();
     }
 
     /**

@@ -1,11 +1,14 @@
 package io.resilio.core.cache;
 
+import io.resilio.core.lifecycle.ManagedResource;
+import io.resilio.core.lifecycle.ResilioResourceManager;
 import io.resilio.core.stats.CacheStats;
 
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Function;
 
@@ -41,7 +44,10 @@ import java.util.function.Function;
  * @author Salvatore Milazzo <milazzosa@gmail.com>
  * @since 1.0.0
  */
-public class TtlCache<K, V> implements Cache<K, V>, CacheStats {
+public class TtlCache<K, V> implements Cache<K, V>, CacheStats, ManagedResource {
+
+    // Average estimated bytes per entry (key + value + overhead)
+    private static final int ESTIMATED_BYTES_PER_ENTRY = 256;
 
     private final ConcurrentHashMap<K, CacheEntry<V>> cache;
     private final Duration ttl;
@@ -52,6 +58,9 @@ public class TtlCache<K, V> implements Cache<K, V>, CacheStats {
     private final LongAdder hits = new LongAdder();
     private final LongAdder misses = new LongAdder();
     private final LongAdder evictions = new LongAdder();
+
+    // GOVERNANCE V16: Track last access for idle detection
+    private final AtomicLong lastAccessTimeMillis = new AtomicLong(System.currentTimeMillis());
 
     /**
      * Internal cache entry with expiration time.
@@ -67,6 +76,9 @@ public class TtlCache<K, V> implements Cache<K, V>, CacheStats {
         this.ttl = builder.ttl;
         this.maxSize = builder.maxSize;
         this.cache = new ConcurrentHashMap<>(Math.min(maxSize, 256));
+
+        // GOVERNANCE V16: Auto-register with ResourceManager for idle cleanup
+        ResilioResourceManager.getInstance().register(this);
     }
 
     /**
@@ -81,6 +93,7 @@ public class TtlCache<K, V> implements Cache<K, V>, CacheStats {
 
     @Override
     public V get(K key, Function<K, V> loader) {
+        lastAccessTimeMillis.set(System.currentTimeMillis());
         CacheEntry<V> entry = cache.get(key);
 
         if (entry != null && !entry.isExpired()) {
@@ -104,6 +117,7 @@ public class TtlCache<K, V> implements Cache<K, V>, CacheStats {
 
     @Override
     public Optional<V> getIfPresent(K key) {
+        lastAccessTimeMillis.set(System.currentTimeMillis());
         CacheEntry<V> entry = cache.get(key);
 
         if (entry == null) {
@@ -126,6 +140,7 @@ public class TtlCache<K, V> implements Cache<K, V>, CacheStats {
         if (value == null) {
             return;
         }
+        lastAccessTimeMillis.set(System.currentTimeMillis());
 
         // Check size limit before adding
         if (cache.size() >= maxSize) {
@@ -235,6 +250,37 @@ public class TtlCache<K, V> implements Cache<K, V>, CacheStats {
      */
     public int getMaxSize() {
         return maxSize;
+    }
+
+    // =====================================================================
+    // GOVERNANCE V16: ManagedResource implementation
+    // =====================================================================
+
+    @Override
+    public long estimatedMemoryBytes() {
+        return (long) cache.size() * ESTIMATED_BYTES_PER_ENTRY;
+    }
+
+    @Override
+    public long itemCount() {
+        return cache.size();
+    }
+
+    @Override
+    public long releaseAll() {
+        long count = cache.size();
+        cache.clear();
+        return count;
+    }
+
+    @Override
+    public long releaseExpired() {
+        return evictExpired();
+    }
+
+    @Override
+    public long lastAccessTimeMillis() {
+        return lastAccessTimeMillis.get();
     }
 
     /**

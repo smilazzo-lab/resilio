@@ -8,16 +8,23 @@
         <groupId>io.resilio</groupId>
         <artifactId>resilio-parent</artifactId>
         <version>1.0.0</version>
+        <relativePath>../pom.xml</relativePath>
     </parent>
 
     <artifactId>resilio-core</artifactId>
     <name>RESILIO Core</name>
     <description>
         Core caching abstractions: CacheStats, CircuitBreaker, TTL/LRU implementations.
-        Zero external dependencies.
+        GOVERNANCE V16: ResourceManager for automatic idle memory cleanup.
     </description>
 
     <dependencies>
+        <!-- SLF4J for logging (GOVERNANCE V16) -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>

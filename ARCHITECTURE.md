@@ -14,12 +14,13 @@ A high-performance caching framework for Java with built-in resilience patterns,
 2. [Module Structure](#2-module-structure)
 3. [Core Concepts](#3-core-concepts)
 4. [Component Architecture](#4-component-architecture)
-5. [Threading Model](#5-threading-model)
-6. [Configuration Guide](#6-configuration-guide)
-7. [Developer Manual](#7-developer-manual)
-8. [Testing Guide](#8-testing-guide)
-9. [Build and Deploy](#9-build-and-deploy)
-10. [Best Practices](#10-best-practices)
+5. [Interceptor Pattern](#5-interceptor-pattern)
+6. [Threading Model](#6-threading-model)
+7. [Configuration Guide](#7-configuration-guide)
+8. [Developer Manual](#8-developer-manual)
+9. [Testing Guide](#9-testing-guide)
+10. [Build and Deploy](#10-build-and-deploy)
+11. [Best Practices](#11-best-practices)
 
 ---
 
@@ -446,7 +447,194 @@ Cluster (Sharding):
 
 ---
 
-## 5. Threading Model
+## 5. Interceptor Pattern
+
+The Interceptor pattern in RESILIO provides a powerful way to wrap operations with cross-cutting concerns like security, auditing, and transformation.
+
+### 5.1 Interceptor Interface
+
+```java
+public interface Interceptor<C, R> {
+    // Called before operation - can modify context
+    default C before(C context) { return context; }
+
+    // Called after operation - can modify result
+    default R after(C context, R result) { return result; }
+
+    // Called when operation throws exception
+    default void onError(C context, Exception error) { }
+
+    // Order of execution (lower = earlier)
+    default int order() { return 0; }
+}
+```
+
+### 5.2 Execution Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    InterceptorChain.execute()                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐       │
+│   │ Interceptor A│   │ Interceptor B│   │ Interceptor C│       │
+│   │   order=10   │   │   order=20   │   │   order=30   │       │
+│   └──────────────┘   └──────────────┘   └──────────────┘       │
+│          │                  │                  │                │
+│          ▼                  ▼                  ▼                │
+│      before(ctx)  →    before(ctx)  →    before(ctx)           │
+│                                                                 │
+│                         ┌────────────┐                          │
+│                         │ Operation  │                          │
+│                         │  Execute   │                          │
+│                         └────────────┘                          │
+│                                                                 │
+│      after(result) ←   after(result) ←   after(result)         │
+│          ▲                  ▲                  ▲                │
+│          │                  │                  │                │
+│   (reverse order for after() and onError())                    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key rules:**
+- `before()` runs in order (A → B → C)
+- `after()` runs in reverse order (C → B → A)
+- `onError()` runs in reverse order when exception occurs
+- `after()` is NOT called if operation throws
+
+### 5.3 Use Cases
+
+#### Security: Add WHERE Clause
+
+```java
+Interceptor<QueryContext, List<Entity>> securityFilter = new Interceptor<>() {
+    @Override
+    public QueryContext before(QueryContext ctx) {
+        // Add security filter to query
+        return ctx.withWhereClause("org_unit IN :allowedUnits");
+    }
+
+    @Override
+    public int order() { return 10; } // Run early
+};
+```
+
+#### Audit: Log Access
+
+```java
+Interceptor<QueryContext, List<Entity>> auditor = new Interceptor<>() {
+    @Override
+    public List<Entity> after(QueryContext ctx, List<Entity> result) {
+        auditLog.record(ctx.getUser(), ctx.getQuery(), result.size());
+        return result; // Return unchanged
+    }
+
+    @Override
+    public int order() { return 100; } // Run late
+};
+```
+
+#### Error Handling: Notify on Failure
+
+```java
+Interceptor<QueryContext, List<Entity>> errorNotifier = new Interceptor<>() {
+    @Override
+    public void onError(QueryContext ctx, Exception error) {
+        alertService.notify("Query failed: " + ctx.getQuery(), error);
+    }
+};
+```
+
+#### Result Transformation: Filter Sensitive Data
+
+```java
+Interceptor<QueryContext, List<User>> sensitiveDataFilter = new Interceptor<>() {
+    @Override
+    public List<User> after(QueryContext ctx, List<User> users) {
+        if (!ctx.hasPermission("VIEW_SSN")) {
+            users.forEach(u -> u.setSsn("***-**-****"));
+        }
+        return users;
+    }
+};
+```
+
+### 5.4 Building Interceptor Chains
+
+```java
+// Full builder pattern
+InterceptorChain<QueryContext, List<Entity>> chain = InterceptorChain
+    .<QueryContext, List<Entity>>builder()
+    .add(securityFilter)     // Full interceptor
+    .add(auditor)            // Full interceptor
+    .build();
+
+// Lambda shortcuts
+InterceptorChain<String, String> simpleChain = InterceptorChain
+    .<String, String>builder()
+    .before(ctx -> ctx.toUpperCase())           // Just before
+    .after((ctx, result) -> result + "!")       // Just after
+    .build();
+
+// Empty chain (no-op)
+InterceptorChain<String, String> empty = InterceptorChain.empty();
+```
+
+### 5.5 Executing Through Chain
+
+```java
+// Execute with chain
+List<Entity> results = chain.execute(queryContext, ctx -> {
+    // This is the actual operation
+    return repository.findAll(ctx.getSpec());
+});
+
+// Chain transforms:
+// 1. before(): ctx gets security WHERE clause added
+// 2. operation: repository.findAll() executes
+// 3. after(): audit log records access
+// Result: filtered, audited data returned
+```
+
+### 5.6 Real-World Example: Secure Repository
+
+```java
+public class SecureRepository<T> {
+    private final Repository<T> delegate;
+    private final InterceptorChain<QueryContext, List<T>> chain;
+
+    public SecureRepository(Repository<T> delegate, User currentUser) {
+        this.delegate = delegate;
+        this.chain = InterceptorChain.<QueryContext, List<T>>builder()
+            // Security: filter by user's org units
+            .add(new OrgUnitSecurityInterceptor(currentUser))
+            // Audit: log all queries
+            .add(new AuditInterceptor())
+            // Metrics: track query performance
+            .add(new MetricsInterceptor())
+            .build();
+    }
+
+    public List<T> findAll(Specification<T> spec) {
+        QueryContext ctx = new QueryContext(spec, currentUser);
+        return chain.execute(ctx, c -> delegate.findAll(c.getSpec()));
+    }
+}
+```
+
+### 5.7 Thread Safety
+
+`InterceptorChain` is **thread-safe** for execution:
+- The chain itself is immutable after construction
+- Multiple threads can call `execute()` concurrently
+- Each execution has its own context flow
+
+**Note:** Your interceptors must also be thread-safe if they access shared state.
+
+---
+
+## 6. Threading Model
 
 ### Thread Safety Guarantees
 
@@ -484,9 +672,9 @@ hits.increment();  // No contention
 
 ---
 
-## 6. Configuration Guide
+## 7. Configuration Guide
 
-### 6.1 LruCache Configuration
+### 7.1 LruCache Configuration
 
 ```java
 LruCache<String, User> cache = LruCache.<String, User>builder()
@@ -495,7 +683,7 @@ LruCache<String, User> cache = LruCache.<String, User>builder()
     .build();
 ```
 
-### 6.2 TtlCache Configuration
+### 7.2 TtlCache Configuration
 
 ```java
 TtlCache<String, Session> cache = TtlCache.<String, Session>builder()
@@ -505,7 +693,7 @@ TtlCache<String, Session> cache = TtlCache.<String, Session>builder()
     .build();
 ```
 
-### 6.3 CircuitBreaker Configuration
+### 7.3 CircuitBreaker Configuration
 
 ```java
 CircuitBreaker breaker = CircuitBreaker.builder()
@@ -515,7 +703,7 @@ CircuitBreaker breaker = CircuitBreaker.builder()
     .build();
 ```
 
-### 6.4 PrimitiveArrayCache Configuration
+### 7.4 PrimitiveArrayCache Configuration
 
 ```java
 PrimitiveArrayCache cache = PrimitiveArrayCache.builder()
@@ -532,7 +720,7 @@ cache.incrementInt(userCountIdx);
 int count = cache.getInt(userCountIdx);
 ```
 
-### 6.5 ObjectPool Configuration
+### 7.5 ObjectPool Configuration
 
 ```java
 ObjectPool<StringBuilder> pool = ObjectPool.<StringBuilder>builder()
@@ -549,7 +737,7 @@ try (var handle = pool.borrowHandle()) {
 }
 ```
 
-### 6.6 EventAggregator Configuration
+### 7.6 EventAggregator Configuration
 
 ```java
 EventAggregator<ClickEvent, ClickSummary> aggregator =
@@ -567,7 +755,7 @@ EventAggregator<ClickEvent, ClickSummary> aggregator =
 aggregator.record(new ClickEvent("user-123", "/page1"));
 ```
 
-### 6.7 RedisCache Configuration
+### 7.7 RedisCache Configuration
 
 ```java
 RedisCacheConfig config = RedisCacheConfig.builder()
@@ -590,7 +778,7 @@ RedisCache<String, User> cache = RedisCache.<String, User>builder()
     .build();
 ```
 
-### 6.8 AsyncBuffer Configuration
+### 7.8 AsyncBuffer Configuration
 
 ```java
 AsyncBuffer<Event> buffer = AsyncBuffer.<Event>builder()
@@ -605,9 +793,9 @@ AsyncBuffer<Event> buffer = AsyncBuffer.<Event>builder()
 
 ---
 
-## 7. Developer Manual
+## 8. Developer Manual
 
-### 7.1 Quick Start
+### 8.1 Quick Start
 
 **Add dependency:**
 
@@ -657,7 +845,7 @@ CacheStats stats = userCache.stats();
 System.out.println("Hit rate: " + stats.hitRate());
 ```
 
-### 7.2 Using Circuit Breaker
+### 8.2 Using Circuit Breaker
 
 ```java
 CircuitBreaker breaker = Resilio.circuitBreaker()
@@ -678,7 +866,7 @@ try {
 Optional<String> result = breaker.tryExecute(() -> callApi());
 ```
 
-### 7.3 Cache with Circuit Breaker
+### 8.3 Cache with Circuit Breaker
 
 ```java
 // Wrap any cache with circuit breaker protection
@@ -689,7 +877,7 @@ var protectedCache = new CircuitBreakerCache<>(
 );
 ```
 
-### 7.4 Zero-GC Caching
+### 8.4 Zero-GC Caching
 
 **For primitive counters/metrics:**
 
@@ -723,7 +911,7 @@ try (var handle = bufferPool.borrowHandle()) {
 } // Automatically returned to pool
 ```
 
-### 7.5 Event Aggregation
+### 8.5 Event Aggregation
 
 **Reduce database writes by 99%:**
 
@@ -748,7 +936,7 @@ aggregator.record(new Click("/home", now()));
 // 1M clicks → ~1000 DB writes (1000x reduction)
 ```
 
-### 7.6 Redis Distributed Cache
+### 8.6 Redis Distributed Cache
 
 ```java
 // Configure connection
@@ -770,7 +958,7 @@ RedisCache<String, Product> cache = RedisCache.<String, Product>builder()
 Product product = cache.get("product-123", id -> loadProduct(id));
 ```
 
-### 7.7 Redis Pub/Sub
+### 8.7 Redis Pub/Sub
 
 ```java
 RedisPubSub pubsub = new RedisPubSub(connectionManager);
@@ -784,7 +972,7 @@ pubsub.subscribe("events", message -> {
 pubsub.publish("events", "Hello World");
 ```
 
-### 7.8 Redis Streams
+### 8.8 Redis Streams
 
 ```java
 RedisStream stream = new RedisStream(connectionManager, "my-stream");
@@ -802,7 +990,7 @@ stream.consume("processors", "worker-1", messages -> {
 });
 ```
 
-### 7.9 Resource Management
+### 8.9 Resource Management
 
 ```java
 // Get the global resource manager
@@ -825,9 +1013,9 @@ manager.releaseIdleResources(Duration.ofMinutes(10));
 
 ---
 
-## 8. Testing Guide
+## 9. Testing Guide
 
-### 8.1 Test Structure
+### 9.1 Test Structure
 
 ```
 resilio-core/src/test/java/io/resilio/core/
@@ -851,7 +1039,7 @@ resilio-core/src/test/java/io/resilio/core/
     └── ResilioStressTest.java
 ```
 
-### 8.2 Running Tests
+### 9.2 Running Tests
 
 ```bash
 # Run all tests
@@ -867,7 +1055,7 @@ mvn test -Dtest=LruCacheTest
 mvn test jacoco:report
 ```
 
-### 8.3 Writing Tests
+### 9.3 Writing Tests
 
 **Unit test example:**
 
@@ -921,7 +1109,7 @@ class ResilioIntegrationTest {
 }
 ```
 
-### 8.4 Benchmark Tests
+### 9.4 Benchmark Tests
 
 ```java
 class ResilioBenchmarkTest {
@@ -956,9 +1144,9 @@ class ResilioBenchmarkTest {
 
 ---
 
-## 9. Build and Deploy
+## 10. Build and Deploy
 
-### 9.1 Build Commands
+### 10.1 Build Commands
 
 ```bash
 # Clean build
@@ -974,7 +1162,7 @@ mvn clean install -pl resilio-core
 mvn clean install -pl resilio-redis -am
 ```
 
-### 9.2 Project Structure
+### 10.2 Project Structure
 
 ```
 resilio/
@@ -997,7 +1185,7 @@ resilio/
     └── pom.xml                # Aggregator only
 ```
 
-### 9.3 Maven Configuration
+### 10.3 Maven Configuration
 
 **Parent POM properties:**
 
@@ -1017,7 +1205,7 @@ resilio/
 - `maven-source-plugin` - Source JAR
 - `maven-javadoc-plugin` - Javadoc generation
 
-### 9.4 Release Process
+### 10.4 Release Process
 
 ```bash
 # Set release version
@@ -1033,9 +1221,9 @@ git push origin v1.0.0
 
 ---
 
-## 10. Best Practices
+## 11. Best Practices
 
-### 10.1 Cache Sizing
+### 11.1 Cache Sizing
 
 ```java
 // Good: Size based on memory budget
@@ -1051,7 +1239,7 @@ LruCache<String, User> cache = LruCache.<String, User>builder()
 // 100MB budget → ~100,000 entries
 ```
 
-### 10.2 TTL Selection
+### 11.2 TTL Selection
 
 ```java
 // Session data: Match session timeout
@@ -1070,7 +1258,7 @@ TtlCache<String, StockPrice> prices = TtlCache.<String, StockPrice>builder()
     .build();
 ```
 
-### 10.3 Circuit Breaker Tuning
+### 11.3 Circuit Breaker Tuning
 
 ```java
 // Fast-fail for user-facing APIs
@@ -1086,7 +1274,7 @@ CircuitBreaker batchJob = CircuitBreaker.builder()
     .build();
 ```
 
-### 10.4 Zero-GC Guidelines
+### 11.4 Zero-GC Guidelines
 
 ```java
 // DO: Register all keys at startup
@@ -1113,7 +1301,7 @@ void handleRequest() {
 }
 ```
 
-### 10.5 Resource Cleanup
+### 11.5 Resource Cleanup
 
 ```java
 // Always close resources
@@ -1130,7 +1318,7 @@ Runtime.getRuntime().addShutdownHook(new Thread(() -> {
 }));
 ```
 
-### 10.6 Monitoring
+### 11.6 Monitoring
 
 ```java
 // Expose metrics for monitoring
